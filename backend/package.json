@@ -4,7 +4,8 @@
   "description": "AI-powered data room analyzer backend",
   "main": "server-final.js",
   "scripts": {
-    "start": "node server-final.js",
+    "start": "npm run migrate && node server-final.js",
+    "start:dev": "node server-final.js",
     "dev": "nodemon server-final.js",
     "test": "jest --testTimeout=30000",
     "test:watch": "jest --watch",
