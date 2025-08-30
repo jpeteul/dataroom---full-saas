@@ -6,7 +6,7 @@
   },
   "deploy": {
     "startCommand": "node -e "const pool = require('./database-pool'); pool.query('SELECT NOW()').then(r => console.log('DB SUCCESS:', 
-  r.rows[0])).catch(e => console.error('DB ERROR:', e.message)); setTimeout(() => process.exit(0), 5000)"",
+  r.rows[0])).catch(e => console.error('DB ERROR:', e.message)); setTimeout(() => process.exit(0), 5000)",
     "healthcheckPath": "/health"
   }
 }
