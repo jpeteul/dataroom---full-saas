@@ -7,6 +7,277 @@ const app = express();
 app.set('trust proxy', true);
 const PORT = process.env.PORT || 3001;
 
+// Database initialization and migration logic
+const fs = require('fs');
+const path = require('path');
+const bcrypt = require('bcryptjs');
+
+async function checkAndInitializeDatabase() {
+    console.log('🔍 Checking database state...');
+    
+    try {
+        // Check if core tables exist
+        const tableCheck = await pool.query(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'tenants'
+            ) as tenants_exist,
+            EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'users'
+            ) as users_exist,
+            EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'documents'
+            ) as documents_exist
+        `);
+        
+        const { tenants_exist, users_exist, documents_exist } = tableCheck.rows[0];
+        
+        if (tenants_exist && users_exist && documents_exist) {
+            console.log('✅ Database tables already exist');
+            
+            // Quick validation - check if we have required columns
+            try {
+                await pool.query('SELECT tenant_id FROM users LIMIT 1');
+                await pool.query('SELECT subscription_tier FROM tenants LIMIT 1');
+                console.log('✅ Database schema appears complete');
+                return true;
+            } catch (error) {
+                console.log('⚠️  Database exists but schema may be incomplete, running migration...');
+                return await runDatabaseMigration();
+            }
+        } else {
+            console.log('📋 Database tables missing, initializing...');
+            return await runDatabaseMigration();
+        }
+        
+    } catch (error) {
+        console.error('❌ Database check failed:', error.message);
+        console.log('🔧 Attempting to initialize database...');
+        return await runDatabaseMigration();
+    }
+}
+
+async function runDatabaseMigration() {
+    console.log('🚀 Starting database initialization...');
+    
+    try {
+        // Define the complete schema inline (to avoid file dependency issues)
+        const createTablesSQL = `
+-- Base tables
+CREATE TABLE IF NOT EXISTS tenants (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    subscription_tier VARCHAR(50) DEFAULT 'starter',
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    tenant_id INTEGER REFERENCES tenants(id),
+    role VARCHAR(50) DEFAULT 'user',
+    global_role VARCHAR(50),
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS documents (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER REFERENCES tenants(id),
+    user_id INTEGER REFERENCES users(id),
+    filename VARCHAR(255) NOT NULL,
+    original_filename VARCHAR(255) NOT NULL,
+    s3_key VARCHAR(500) NOT NULL,
+    s3_bucket VARCHAR(255) NOT NULL,
+    file_size BIGINT,
+    mime_type VARCHAR(100),
+    upload_status VARCHAR(50) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS analytics_questions (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER REFERENCES tenants(id),
+    user_id INTEGER REFERENCES users(id),
+    question TEXT NOT NULL,
+    answer TEXT,
+    documents_referenced INTEGER[],
+    response_time_ms INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Tenant settings table
+CREATE TABLE IF NOT EXISTS tenant_settings (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER UNIQUE REFERENCES tenants(id),
+    company_name VARCHAR(255),
+    logo_url VARCHAR(500),
+    primary_color VARCHAR(7) DEFAULT '#4F46E5',
+    secondary_color VARCHAR(7) DEFAULT '#10B981',
+    app_title VARCHAR(100) DEFAULT 'Smart DataRoom',
+    welcome_message TEXT,
+    custom_domain VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Activity logs table
+CREATE TABLE IF NOT EXISTS activity_logs (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER REFERENCES tenants(id),
+    user_id INTEGER REFERENCES users(id),
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(100),
+    resource_id INTEGER,
+    details JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Usage tracking table
+CREATE TABLE IF NOT EXISTS usage_tracking (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER REFERENCES tenants(id),
+    user_id INTEGER REFERENCES users(id),
+    action_type VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(100),
+    quantity INTEGER DEFAULT 1,
+    metadata JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Revenue tracking table
+CREATE TABLE IF NOT EXISTS revenue_events (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER REFERENCES tenants(id),
+    event_type VARCHAR(100) NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    description TEXT,
+    metadata JSONB,
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_users_tenant_id ON users(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_documents_tenant_id ON documents(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_analytics_tenant_id ON analytics_questions(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_activity_logs_tenant_id ON activity_logs(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_usage_tracking_tenant_id ON usage_tracking(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_revenue_events_tenant_id ON revenue_events(tenant_id);
+
+-- Create updated_at triggers
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_tenants_updated_at BEFORE UPDATE ON tenants
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_documents_updated_at BEFORE UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+        `;
+
+        // Execute the schema creation
+        console.log('📝 Creating database schema...');
+        await pool.query(createTablesSQL);
+        console.log('✅ Database schema created successfully');
+
+        // Check if superadmin already exists
+        const superadminCheck = await pool.query(
+            "SELECT id FROM users WHERE global_role = 'superadmin' AND email = 'superadmin@saasplatform.com'"
+        );
+
+        if (superadminCheck.rows.length === 0) {
+            // Create superadmin user
+            console.log('👤 Creating superadmin user...');
+            const superadminPassword = process.env.SUPERADMIN_PASSWORD || 'SuperAdmin123!';
+            const hashedPassword = await bcrypt.hash(superadminPassword, 10);
+            
+            await pool.query(`
+                INSERT INTO users (email, password_hash, name, global_role, is_active)
+                VALUES ('superadmin@saasplatform.com', $1, 'Super Administrator', 'superadmin', true)
+            `, [hashedPassword]);
+            
+            console.log('✅ Superadmin user created');
+            console.log('📧 Superadmin credentials:');
+            console.log('   Email: superadmin@saasplatform.com');
+            console.log(`   Password: ${superadminPassword}`);
+            console.log('⚠️  IMPORTANT: Change the superadmin password after first login!');
+        } else {
+            console.log('✅ Superadmin user already exists');
+        }
+
+        // Create a default demo tenant if none exist
+        const tenantCheck = await pool.query('SELECT COUNT(*) as count FROM tenants');
+        if (parseInt(tenantCheck.rows[0].count) === 0) {
+            console.log('🏢 Creating demo tenant...');
+            await pool.query(`
+                INSERT INTO tenants (name, slug, subscription_tier, is_active)
+                VALUES ('Demo Company', 'demo', 'pro', true)
+            `);
+            console.log('✅ Demo tenant created');
+        }
+
+        console.log('🎉 Database initialization completed successfully!');
+        return true;
+
+    } catch (error) {
+        console.error('❌ Database initialization failed:', error);
+        throw error;
+    }
+}
+
+// Auto-initialize database before starting server
+async function initializeDatabase() {
+    try {
+        const dbReady = await checkAndInitializeDatabase();
+        if (!dbReady) {
+            throw new Error('Database initialization failed');
+        }
+        
+        // Additional startup checks
+        const stats = await pool.query(`
+            SELECT 
+                (SELECT COUNT(*) FROM tenants WHERE is_active = true) as active_tenants,
+                (SELECT COUNT(*) FROM users WHERE global_role = 'superadmin') as superadmins,
+                (SELECT COUNT(*) FROM users WHERE is_active = true) as total_users
+        `);
+        
+        console.log('\n📊 Database Ready:');
+        console.log(`   Active Tenants: ${stats.rows[0].active_tenants}`);
+        console.log(`   Superadmins: ${stats.rows[0].superadmins}`);
+        console.log(`   Total Users: ${stats.rows[0].total_users}`);
+        console.log('');
+        
+        return true;
+    } catch (error) {
+        console.error('💥 Fatal: Could not initialize database:', error.message);
+        process.exit(1);
+    }
+}
+
 // Import middleware
 const { authenticateToken } = require('./middleware/auth-middleware');
 const tenantMiddleware = require('./middleware/tenant-middleware');
@@ -271,39 +542,12 @@ app.use((req, res) => {
 // Initialize application
 async function initializeApp() {
     try {
-        // Database connection test
+        // First, test basic database connection
         const result = await pool.query('SELECT NOW() as timestamp, version() as pg_version');
         console.log('✅ Database connected:', result.rows[0].timestamp);
         
-        // Check multi-tenant setup
-        const setupCheck = await pool.query(`
-            SELECT 
-                (SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'tenants')) as tenants_exist,
-                (SELECT COUNT(*) FROM tenants WHERE is_active = true) as active_tenants,
-                (SELECT COUNT(*) FROM users WHERE global_role = 'superadmin') as superadmins,
-                (SELECT COUNT(*) FROM users WHERE is_active = true) as total_users,
-                (SELECT COUNT(*) FROM documents) as total_documents
-        `);
-        
-        const setup = setupCheck.rows[0];
-        
-        if (!setup.tenants_exist) {
-            console.error('❌ Multi-tenant tables not found!');
-            console.log('Run: node migrate.js');
-            process.exit(1);
-        }
-        
-        console.log('\n📊 Platform Statistics:');
-        console.log(`   Active Tenants: ${setup.active_tenants}`);
-        console.log(`   Total Users: ${setup.total_users}`);
-        console.log(`   Superadmins: ${setup.superadmins}`);
-        console.log(`   Total Documents: ${setup.total_documents}`);
-        
-        // Check for any system alerts
-        if (setup.active_tenants === 0 && setup.total_users === 0) {
-            console.log('\n⚠️  Warning: No active tenants found');
-            console.log('   Consider creating a test tenant to verify setup');
-        }
+        // Initialize/check database schema
+        await initializeDatabase();
         
         // Start server
         app.listen(PORT, () => {
@@ -312,11 +556,6 @@ async function initializeApp() {
             console.log(`   📊 Health: http://localhost:${PORT}/health`);
             console.log(`   📋 API Docs: http://localhost:${PORT}/api/version`);
             console.log(`   🔐 Mode: ${process.env.NODE_ENV || 'development'}`);
-            
-            if (setup.superadmins > 0) {
-                console.log(`   👤 Superadmin access available`);
-            }
-            
             console.log('\n✨ Multi-tenant architecture fully operational!\n');
         });
         
@@ -325,7 +564,6 @@ async function initializeApp() {
         process.exit(1);
     }
 }
-
 // Graceful shutdown
 const gracefulShutdown = async (signal) => {
     console.log(`\n📴 ${signal} received, shutting down gracefully...`);
