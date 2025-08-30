@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS tenants (
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
+    password VARCHAR(255) NOT NULL,
     name VARCHAR(255) NOT NULL,
     tenant_id INTEGER REFERENCES tenants(id),
     role VARCHAR(50) DEFAULT 'user',
@@ -216,7 +216,7 @@ CREATE TRIGGER update_documents_updated_at BEFORE UPDATE ON documents
             const hashedPassword = await bcrypt.hash(superadminPassword, 10);
             
             await pool.query(`
-                INSERT INTO users (email, password_hash, name, global_role, is_active)
+                INSERT INTO users (email, password, name, global_role, is_active)
                 VALUES ('superadmin@saasplatform.com', $1, 'Super Administrator', 'superadmin', true)
             `, [hashedPassword]);
             
