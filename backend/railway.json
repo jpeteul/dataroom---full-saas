@@ -5,7 +5,7 @@
     "dockerfilePath": "/backend/Dockerfile"
   },
   "deploy": {
-    "startCommand": "node migrate-simple.js && node server-final.js",
+    "startCommand": "node migrate.js && node server-final.js",
     "healthcheckPath": "/health"
   }
 }
