@@ -8,7 +8,11 @@ async function runMigrations() {
     console.log('🚀 Starting multi-tenant migration...\n');
 
     try {
-        // Read migration file
+        // Read base tables migration first
+        const baseMigrationPath = path.join(__dirname, 'migrations', '000_create_base_tables.sql');
+        const baseMigrationSQL = fs.readFileSync(baseMigrationPath, 'utf8');
+        
+        // Read multi-tenant migration
         const migrationPath = path.join(__dirname, 'migrations', '001_add_multi_tenant_support.sql');
         let migrationSQL = fs.readFileSync(migrationPath, 'utf8');
 
@@ -22,8 +26,11 @@ async function runMigrations() {
             hashedPassword
         );
 
+        // Combine both migrations
+        const allSQL = baseMigrationSQL + '\n\n' + migrationSQL;
+
         // Split by semicolons but preserve those within strings
-        const statements = migrationSQL
+        const statements = allSQL
             .split(/;(?=(?:[^']*'[^']*')*[^']*$)/)
             .map(s => s.trim())
             .filter(s => s.length > 0 && !s.startsWith('--'));
